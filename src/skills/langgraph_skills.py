@@ -56,7 +56,7 @@ def load_pdf_node(state: AgentState):
 
 from openai import OpenAI
 import os
-os.environ["OPENAI_API_KEY"] = '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'
+os.environ["OPENAI_API_KEY"] = 'YOUR_OPEN_AI_KEY'
 
 client = OpenAI()
 
