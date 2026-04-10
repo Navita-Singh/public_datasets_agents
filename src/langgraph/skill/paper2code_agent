@@ -1,0 +1,265 @@
+# =========================
+# Paper2Code Agent (LangGraph + Trace)
+# =========================
+
+from typing import TypedDict, Optional, List, Dict, Any
+import os
+import json
+import fitz
+import subprocess
+import tempfile
+from datetime import datetime
+
+from langgraph.graph import StateGraph, END
+from openai import OpenAI
+
+# =========================
+# CONFIG
+# =========================
+
+os.environ["OPENAI_API_KEY"] = "YOUR_OPENAI_KEY"
+
+client = OpenAI()
+
+# =========================
+# STATE
+# =========================
+
+class AgentState(TypedDict):
+    paper_text: str
+    spec: str
+    code: str
+    error: Optional[str]
+    iteration: int
+    trace: List[Dict[str, Any]]
+
+# =========================
+# TRACE LOGGER
+# =========================
+
+def log_event(state, event_name, data):
+    trace = state.get("trace", [])
+
+    trace.append({
+        "timestamp": str(datetime.now()),
+        "event": event_name,
+        "data": data
+    })
+
+    return trace
+
+# =========================
+# LLM CALL
+# =========================
+
+def call_llm(prompt: str) -> str:
+    res = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2
+    )
+    return res.choices[0].message.content
+
+# =========================
+# 1. LOAD PDF NODE
+# =========================
+
+def load_pdf_node(state: AgentState):
+    doc = fitz.open("C:/Laptop_current/git_projects/public_datasets_agents/src/langgraph/skill/paper.pdf")
+    text = ""
+
+    for page in doc:
+        text += page.get_text()
+
+    trace = log_event(state, "load_pdf", {
+        "num_pages": len(doc),
+        "text_length": len(text)
+    })
+
+    return {
+        "paper_text": text,
+        "trace": trace
+    }
+
+# =========================
+# 2. EXTRACT SPEC NODE
+# =========================
+
+def extract_spec_node(state: AgentState):
+    prompt = f"""
+Extract structured ML implementation spec:
+
+- model
+- layers
+- loss
+- optimizer
+- training loop
+
+PAPER:
+{state['paper_text']}
+"""
+
+    spec = call_llm(prompt)
+
+    trace = log_event(state, "extract_spec", {
+        "spec_length": len(spec)
+    })
+
+    return {
+        "spec": spec,
+        "trace": trace
+    }
+
+# =========================
+# 3. GENERATE CODE NODE
+# =========================
+
+def generate_code_node(state: AgentState):
+    prompt = f"""
+Convert this ML spec into runnable PyTorch code.
+
+Rules:
+- single file
+- complete training loop
+- no pseudocode
+
+SPEC:
+{state['spec']}
+"""
+
+    code = call_llm(prompt)
+
+    trace = log_event(state, "generate_code", {
+        "code_length": len(code),
+        "iteration": state.get("iteration", 0) + 1
+    })
+
+    return {
+        "code": code,
+        "iteration": state.get("iteration", 0) + 1,
+        "trace": trace
+    }
+
+# =========================
+# 4. EXECUTE CODE NODE
+# =========================
+
+def execute_node(state: AgentState):
+    with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as f:
+        f.write(state["code"].encode())
+        f.flush()
+
+        result = subprocess.run(
+            ["python", f.name],
+            capture_output=True,
+            text=True
+        )
+
+    success = result.returncode == 0
+    error = None if success else result.stderr
+
+    trace = log_event(state, "execute_code", {
+        "success": success,
+        "error_preview": error[-500:] if error else None
+    })
+
+    return {
+        "error": error,
+        "trace": trace
+    }
+
+# =========================
+# 5. FIX CODE NODE
+# =========================
+
+def fix_code_node(state: AgentState):
+    prompt = f"""
+Fix this PyTorch code.
+
+Error:
+{state['error']}
+
+Code:
+{state['code']}
+"""
+
+    fixed_code = call_llm(prompt)
+
+    trace = log_event(state, "fix_code", {
+        "fix_length": len(fixed_code)
+    })
+
+    return {
+        "code": fixed_code,
+        "trace": trace
+    }
+
+# =========================
+# ROUTING LOGIC
+# =========================
+
+def should_continue(state: AgentState):
+    if state["error"] is None:
+        return "end"
+    if state["iteration"] > 5:
+        return "end"
+    return "fix"
+
+# =========================
+# BUILD GRAPH
+# =========================
+
+graph = StateGraph(AgentState)
+
+graph.add_node("load", load_pdf_node)
+graph.add_node("spec", extract_spec_node)
+graph.add_node("code", generate_code_node)
+graph.add_node("exec", execute_node)
+graph.add_node("fix", fix_code_node)
+
+graph.set_entry_point("load")
+
+graph.add_edge("load", "spec")
+graph.add_edge("spec", "code")
+graph.add_edge("code", "exec")
+
+graph.add_conditional_edges(
+    "exec",
+    should_continue,
+    {
+        "fix": "fix",
+        "end": END
+    }
+)
+
+graph.add_edge("fix", "code")
+
+app = graph.compile()
+
+# =========================
+# RUN AGENT
+# =========================
+
+if __name__ == "__main__":
+
+    initial_state = {
+        "paper_text": "",
+        "spec": "",
+        "code": "",
+        "error": None,
+        "iteration": 0,
+        "trace": []
+    }
+
+    result = app.invoke(initial_state)
+
+    print("\n================ CODE OUTPUT ================\n")
+    print(result["code"])
+
+    # Save trace for Streamlit dashboard
+    os.makedirs("traces", exist_ok=True)
+
+    with open("traces/run_1.json", "w") as f:
+        json.dump(result, f, indent=2)
+
+    print("\nTrace saved to traces/run_1.json")
